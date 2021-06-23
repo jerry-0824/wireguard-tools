@@ -311,66 +311,6 @@ skip:;
 	return handle;
 }
 
-static BOOL elevated_ioctl(HANDLE handle, DWORD code, void *in_buf, DWORD in_buf_len, void *out_buf, DWORD out_buf_len, DWORD *bytes_returned)
-{
-	HANDLE thread_token, process_snapshot, winlogon_process, winlogon_token, duplicated_token;
-	PROCESSENTRY32 entry = { .dwSize = sizeof(PROCESSENTRY32) };
-	TOKEN_PRIVILEGES privileges = {
-		.PrivilegeCount = 1,
-		.Privileges = {{ .Attributes = SE_PRIVILEGE_ENABLED }}
-	};
-	SID expected_sid;
-	DWORD bytes = sizeof(expected_sid);
-	BOOL ret;
-
-	if (!LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &privileges.Privileges[0].Luid))
-		return FALSE;
-	if (!CreateWellKnownSid(WinLocalSystemSid, NULL, &expected_sid, &bytes))
-		return FALSE;
-
-	process_snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-	if (process_snapshot == INVALID_HANDLE_VALUE)
-		return FALSE;
-	for (ret = Process32First(process_snapshot, &entry); ret; ret = Process32Next(process_snapshot, &entry)) {
-		if (strcasecmp(entry.szExeFile, "winlogon.exe"))
-			continue;
-
-		RevertToSelf();
-		if (!ImpersonateSelf(SecurityImpersonation))
-			continue;
-		if (!OpenThreadToken(GetCurrentThread(), TOKEN_ADJUST_PRIVILEGES, FALSE, &thread_token))
-			continue;
-		if (!AdjustTokenPrivileges(thread_token, FALSE, &privileges, sizeof(privileges), NULL, NULL)) {
-			CloseHandle(thread_token);
-			continue;
-		}
-		CloseHandle(thread_token);
-
-		winlogon_process = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, entry.th32ProcessID);
-		if (!winlogon_process)
-			continue;
-		if (!OpenProcessToken(winlogon_process, TOKEN_IMPERSONATE | TOKEN_DUPLICATE, &winlogon_token))
-			continue;
-		CloseHandle(winlogon_process);
-		if (!DuplicateToken(winlogon_token, SecurityImpersonation, &duplicated_token)) {
-			RevertToSelf();
-			continue;
-		}
-		CloseHandle(winlogon_token);
-		if (!SetThreadToken(NULL, duplicated_token)) {
-			CloseHandle(duplicated_token);
-			continue;
-		}
-		CloseHandle(duplicated_token);
-		ret = DeviceIoControl(handle, code, in_buf, in_buf_len, out_buf, out_buf_len, bytes_returned, NULL);
-		break;
-	}
-
-	RevertToSelf();
-	CloseHandle(process_snapshot);
-	return ret;
-}
-
 static int kernel_get_device(struct wgdevice **device, const char *iface)
 {
 	WG_IOCTL_INTERFACE *wg_iface;
@@ -389,10 +329,10 @@ static int kernel_get_device(struct wgdevice **device, const char *iface)
 	if (!handle)
 		return -errno;
 
-	while (!elevated_ioctl(handle, WG_IOCTL_GET, NULL, 0, buf, buf_len, &buf_len)) {
+	while (!DeviceIoControl(handle, WG_IOCTL_GET, NULL, 0, buf, buf_len, &buf_len, NULL)) {
 		free(buf);
 		if (GetLastError() != ERROR_MORE_DATA) {
-			errno = EIO;
+			errno = EACCES;
 			return -errno;
 		}
 		buf = malloc(buf_len);
@@ -586,8 +526,10 @@ static int kernel_set_device(struct wgdevice *dev)
 	}
 	wg_iface->PeersCount = peer_count;
 
-	if (!elevated_ioctl(handle, WG_IOCTL_SET, wg_iface, buf_len, NULL, 0, NULL))
+	if (!DeviceIoControl(handle, WG_IOCTL_SET, wg_iface, buf_len, NULL, 0, NULL, NULL)) {
+		errno = EACCES;
 		goto out;
+	}
 	errno = 0;
 
 out:
